@@ -57,7 +57,7 @@ use smithay::wayland::drm_lease::{
     DrmLease, DrmLeaseBuilder, DrmLeaseRequest, DrmLeaseState, LeaseRejected,
 };
 use smithay::wayland::presentation::Refresh;
-use smithay_drm_extras::drm_scanner::{DrmScanEvent, DrmScanner};
+use smithay_drm_extras::drm_scanner::{CrtcMapper, DrmScanEvent, DrmScanner};
 use wayland_protocols::wp::linux_dmabuf::zv1::server::zwp_linux_dmabuf_feedback_v1::TrancheFlags;
 use wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
 
@@ -131,7 +131,7 @@ pub struct OutputDevice {
     token: RegistrationToken,
     // Can be None for display-only devices such as DisplayLink.
     render_node: Option<DrmNode>,
-    drm_scanner: DrmScanner,
+    drm_scanner: DrmScanner<ParkingCrtcMapper>,
     surfaces: HashMap<crtc::Handle, Surface>,
     known_crtcs: HashMap<crtc::Handle, CrtcInfo>,
     // SAFETY: drop after all the objects used with them are dropped.
@@ -144,6 +144,127 @@ pub struct OutputDevice {
     pub drm_lease_state: Option<DrmLeaseState>,
     non_desktop_connectors: HashSet<(connector::Handle, crtc::Handle)>,
     active_leases: Vec<DrmLease>,
+}
+
+/// Maps a CRTC to every connected connector, like Smithay's `SimpleCrtcMapper`, except that the CRTC of
+/// a "parked" connector can be lent to another one.
+///
+/// A parked connector is one that niri keeps off (`off` in the config, or a laptop panel with the lid
+/// closed) but that the kernel still reports as connected. `SimpleCrtcMapper` keeps its CRTC reserved
+/// until the connector is unplugged, so on hardware with few CRTCs (three on Intel Ice Lake) the last
+/// monitor of a dock never gets one: it is silently ignored and shows a copy of another monitor.
+#[derive(Debug, Default)]
+struct ParkingCrtcMapper {
+    crtcs: HashMap<connector::Handle, crtc::Handle>,
+    parked: HashSet<connector::Handle>,
+}
+
+impl ParkingCrtcMapper {
+    fn set_parked(&mut self, parked: HashSet<connector::Handle>) {
+        self.parked = parked;
+    }
+
+    fn is_taken(&self, crtc: &crtc::Handle) -> bool {
+        self.crtcs.values().any(|v| v == crtc)
+    }
+
+    fn restored_for_connector(
+        &self,
+        drm: &impl Device,
+        connector: &connector::Info,
+    ) -> Option<crtc::Handle> {
+        let encoder = connector.current_encoder()?;
+        let encoder = drm.get_encoder(encoder).ok()?;
+        let crtc = encoder.crtc()?;
+
+        (!self.is_taken(&crtc)).then_some(crtc)
+    }
+
+    /// Picks a free CRTC, else (for connectors that are not parked themselves) one held by a parked
+    /// connector. Returns the CRTC and the parked connector it is taken from, if any.
+    fn pick_for_connector(
+        &self,
+        drm: &impl Device,
+        connector: &connector::Info,
+    ) -> Option<(crtc::Handle, Option<connector::Handle>)> {
+        let res_handles = drm.resource_handles().ok()?;
+
+        let candidates: Vec<crtc::Handle> = connector
+            .encoders()
+            .iter()
+            .flat_map(|encoder_handle| drm.get_encoder(*encoder_handle))
+            .flat_map(|encoder_info| res_handles.filter_crtcs(encoder_info.possible_crtcs()))
+            .collect();
+
+        if let Some(crtc) = candidates.iter().find(|crtc| !self.is_taken(crtc)) {
+            return Some((*crtc, None));
+        }
+
+        if self.parked.contains(&connector.handle()) {
+            return None;
+        }
+
+        candidates.iter().find_map(|crtc| {
+            let (holder, _) = self
+                .crtcs
+                .iter()
+                .find(|(conn, c)| *c == crtc && self.parked.contains(conn))?;
+            Some((*crtc, Some(*holder)))
+        })
+    }
+}
+
+impl CrtcMapper for ParkingCrtcMapper {
+    fn map<'a>(
+        &mut self,
+        drm: &impl Device,
+        connectors: impl Iterator<Item = &'a connector::Info> + Clone,
+    ) {
+        // Release the reservation of every connector that is not connected, including the ones that
+        // vanished from the resource list altogether (DP-MST connectors behind a dock are destroyed
+        // and recreated under new handles), like Smithay/smithay#2076.
+        let connected: HashSet<connector::Handle> = connectors
+            .clone()
+            .filter(|conn| conn.state() == connector::State::Connected)
+            .map(|conn| conn.handle())
+            .collect();
+        self.crtcs.retain(|conn, _| connected.contains(conn));
+
+        let mut needs_crtc: Vec<&connector::Info> = connectors
+            .filter(|conn| conn.state() == connector::State::Connected)
+            .filter(|conn| !self.crtcs.contains_key(&conn.handle()))
+            .collect();
+
+        needs_crtc.retain(|connector| {
+            if let Some(crtc) = self.restored_for_connector(drm, connector) {
+                self.crtcs.insert(connector.handle(), crtc);
+                false
+            } else {
+                true
+            }
+        });
+
+        // Connectors that are not parked choose first, so that a parked one never takes a CRTC that
+        // another connector could use.
+        needs_crtc.sort_by_key(|connector| self.parked.contains(&connector.handle()));
+
+        for connector in needs_crtc {
+            if let Some((crtc, lent_by)) = self.pick_for_connector(drm, connector) {
+                if let Some(lent_by) = lent_by {
+                    debug!(
+                        "lending the crtc of parked connector {lent_by:?} to {:?}",
+                        connector.handle()
+                    );
+                    self.crtcs.remove(&lent_by);
+                }
+                self.crtcs.insert(connector.handle(), crtc);
+            }
+        }
+    }
+
+    fn crtc_for_connector(&self, connector: &connector::Handle) -> Option<crtc::Handle> {
+        self.crtcs.get(connector).copied()
+    }
 }
 
 // A connected, but not necessarily enabled, crtc.
@@ -948,6 +1069,10 @@ impl Tty {
             return;
         }
 
+        // Connectors niri keeps off lend their CRTC to the ones that would otherwise get none.
+        let parked =
+            self.parked_connectors(node, self.should_disable_laptop_panels(niri.is_lid_closed));
+
         let Some(device) = self.devices.get_mut(&node) else {
             if let Some(path) = node.dev_path() {
                 warn!("unknown device; trying to add");
@@ -961,6 +1086,8 @@ impl Tty {
 
             return;
         };
+
+        device.drm_scanner.crtc_mapper_mut().set_parked(parked);
 
         // DrmScanner will preserve any existing connector-CRTC mapping.
         let scan_result = match device.drm_scanner.scan_connectors(&device.drm) {
@@ -1022,6 +1149,18 @@ impl Tty {
                     // We don't actually need to do anything here; on_output_config_changed() will
                     // take care of picking a new mode if needed.
                 }
+                DrmScanEvent::Connected {
+                    connector,
+                    crtc: None,
+                } => {
+                    // The scanner records the connector as connected, so this event is not emitted
+                    // again: without this message the output would just silently be missing.
+                    warn!(
+                        "connector {} is connected but has no CRTC available for it, \
+                         it will not be usable",
+                        format_connector_name(&connector)
+                    );
+                }
                 _ => (),
             }
         }
@@ -1041,35 +1180,8 @@ impl Tty {
             }
         }
 
-        for (crtc, mut info) in added {
-            // Make/model/serial can match exactly between different physical monitors. This doesn't
-            // happen often, but our Layout does not support such duplicates and will panic.
-            //
-            // As a workaround, search for duplicates, and unname the new connectors if one is
-            // found. Connector names are always unique.
-            let name = &mut info.name;
-            let formatted = name.format_make_model_serial_or_connector();
-            for info in self.devices.values().flat_map(|d| d.known_crtcs.values()) {
-                if info.name.matches(&formatted) {
-                    let connector = mem::take(&mut name.connector);
-                    warn!(
-                        "new connector {connector} duplicates make/model/serial \
-                         of existing connector {}, unnaming",
-                        info.name.connector,
-                    );
-                    *name = OutputName {
-                        connector,
-                        make: None,
-                        model: None,
-                        serial: None,
-                    };
-                    break;
-                }
-            }
-
-            // Insert it right away so next added connector will check against this one too.
-            let device = self.devices.get_mut(&node).unwrap();
-            device.known_crtcs.insert(crtc, info);
+        for (crtc, info) in added {
+            self.insert_known_crtc(node, crtc, info);
         }
 
         // If the device was just added or resumed, we need to cleanup any disconnected connectors
@@ -2339,6 +2451,176 @@ impl Tty {
         }
     }
 
+    /// Registers the name of the connector that got `crtc`.
+    fn insert_known_crtc(&mut self, node: DrmNode, crtc: crtc::Handle, mut info: CrtcInfo) {
+        // Make/model/serial can match exactly between different physical monitors. This doesn't
+        // happen often, but our Layout does not support such duplicates and will panic.
+        //
+        // As a workaround, search for duplicates, and unname the new connectors if one is
+        // found. Connector names are always unique.
+        let name = &mut info.name;
+        let formatted = name.format_make_model_serial_or_connector();
+        for info in self.devices.values().flat_map(|d| d.known_crtcs.values()) {
+            if info.name.matches(&formatted) {
+                let connector = mem::take(&mut name.connector);
+                warn!(
+                    "new connector {connector} duplicates make/model/serial \
+                     of existing connector {}, unnaming",
+                    info.name.connector,
+                );
+                *name = OutputName {
+                    connector,
+                    make: None,
+                    model: None,
+                    serial: None,
+                };
+                break;
+            }
+        }
+
+        // Insert it right away so next added connector will check against this one too.
+        let device = self.devices.get_mut(&node).unwrap();
+        device.known_crtcs.insert(crtc, info);
+    }
+
+    /// Connected connectors that niri keeps off (`off` in the config, laptop panel with the lid
+    /// closed) and that don't drive a monitor. The CRTC of such a connector can be lent to another
+    /// connector, and a parked connector without a CRTC only gets a free one, never one that is lent.
+    fn parked_connectors(
+        &self,
+        node: DrmNode,
+        disable_laptop_panels: bool,
+    ) -> HashSet<connector::Handle> {
+        let Some(device) = self.devices.get(&node) else {
+            return HashSet::new();
+        };
+
+        let config = self.config.borrow();
+        let disable_monitor_names = config.debug.disable_monitor_names;
+
+        let mut parked = HashSet::new();
+        for connector in device.drm_scanner.connectors().values() {
+            if connector.state() != connector::State::Connected {
+                continue;
+            }
+
+            let crtc = device.drm_scanner.crtc_for_connector(&connector.handle());
+            let name = match crtc {
+                Some(crtc) => {
+                    if device.surfaces.contains_key(&crtc)
+                        || device
+                            .non_desktop_connectors
+                            .contains(&(connector.handle(), crtc))
+                    {
+                        continue;
+                    }
+                    if device.known_crtcs.contains_key(&crtc) {
+                        device.known_crtc_name(&crtc, connector, disable_monitor_names)
+                    } else {
+                        make_output_name(
+                            &device.drm,
+                            connector.handle(),
+                            format_connector_name(connector),
+                        )
+                    }
+                }
+                // Not mapped: the name comes from the EDID, as for a new connector.
+                None => make_output_name(
+                    &device.drm,
+                    connector.handle(),
+                    format_connector_name(connector),
+                ),
+            };
+
+            let name = if disable_monitor_names {
+                OutputName {
+                    connector: name.connector,
+                    make: None,
+                    model: None,
+                    serial: None,
+                }
+            } else {
+                name
+            };
+
+            let off = config.outputs.find(&name).cloned().unwrap_or_default().off;
+            if off || (disable_laptop_panels && is_laptop_panel(&name.connector)) {
+                parked.insert(connector.handle());
+            }
+        }
+
+        parked
+    }
+
+    /// Updates the parked connectors, remaps the CRTCs, and makes sure that every mapped CRTC has the
+    /// name of the connector that holds it (the mapping can change without a connect event, e.g.
+    /// when a CRTC is lent or when the laptop panel gets one back after a dock is unplugged).
+    /// Returns whether something changed, in which case the output config needs to be applied again.
+    fn remap_crtcs(&mut self, niri: &mut Niri, node: DrmNode) -> bool {
+        let parked =
+            self.parked_connectors(node, self.should_disable_laptop_panels(niri.is_lid_closed));
+
+        let Some(device) = self.devices.get_mut(&node) else {
+            return false;
+        };
+
+        let before: HashMap<connector::Handle, crtc::Handle> = device
+            .drm_scanner
+            .crtcs()
+            .map(|(conn, crtc)| (conn.handle(), crtc))
+            .collect();
+
+        let connectors: Vec<connector::Info> =
+            device.drm_scanner.connectors().values().cloned().collect();
+        let mapper = device.drm_scanner.crtc_mapper_mut();
+        mapper.set_parked(parked);
+        mapper.map(&device.drm, connectors.iter());
+
+        let mut changed = false;
+        let mut after = HashSet::new();
+        let mut added = Vec::new();
+        for (conn, crtc) in device.drm_scanner.crtcs() {
+            after.insert(crtc);
+            if before.get(&conn.handle()) != Some(&crtc) {
+                changed = true;
+            }
+
+            // Known under another connector, or not at all.
+            let connector_name = format_connector_name(conn);
+            let known = device
+                .known_crtcs
+                .get(&crtc)
+                .is_some_and(|info| info.name.connector == connector_name);
+            if !known {
+                let name = make_output_name(&device.drm, conn.handle(), connector_name);
+                debug!(
+                    "connector got a crtc: {} \"{}\"",
+                    &name.connector,
+                    name.format_make_model_serial(),
+                );
+                added.push((
+                    crtc,
+                    CrtcInfo {
+                        id: OutputId::next(),
+                        name,
+                    },
+                ));
+            }
+        }
+
+        // Forget the CRTCs that no connector has anymore.
+        let known_before = device.known_crtcs.len();
+        device.known_crtcs.retain(|crtc, _| after.contains(crtc));
+        changed |= device.known_crtcs.len() != known_before;
+
+        changed |= !added.is_empty();
+        for (crtc, info) in added {
+            self.insert_known_crtc(node, crtc, info);
+        }
+
+        changed
+    }
+
     fn should_disable_laptop_panels(&self, is_lid_closed: bool) -> bool {
         if !is_lid_closed {
             return false;
@@ -2360,12 +2642,21 @@ impl Tty {
     }
 
     pub fn on_output_config_changed(&mut self, niri: &mut Niri) {
+        // A connector that was turned off may have lent its CRTC to a connected one that had none: a
+        // second pass connects it.
+        if self.on_output_config_changed_pass(niri) {
+            self.on_output_config_changed_pass(niri);
+        }
+    }
+
+    /// Returns whether some connector got a different CRTC, so that another pass is needed.
+    fn on_output_config_changed_pass(&mut self, niri: &mut Niri) -> bool {
         let _span = tracy_client::span!("Tty::on_output_config_changed");
 
         // If we're inactive, we can't do anything, so just set a flag for later.
         if !self.session.is_active() {
             self.update_output_config_on_resume = true;
-            return;
+            return false;
         }
         self.update_output_config_on_resume = false;
 
@@ -2548,7 +2839,15 @@ impl Tty {
             }
         }
 
+        // Connectors that are off no longer need their CRTC: lend it to a connected one that has none.
+        let nodes: Vec<DrmNode> = self.devices.keys().copied().collect();
+        let mut remapped = false;
+        for node in nodes {
+            remapped |= self.remap_crtcs(niri, node);
+        }
+
         self.refresh_ipc_outputs(niri);
+        remapped
     }
 
     pub fn get_device_from_node(&mut self, node: DrmNode) -> Option<&mut OutputDevice> {
@@ -2574,6 +2873,34 @@ impl Tty {
                 }
 
                 let output_name = device.known_crtc_name(&crtc, connector, disable_monitor_names);
+                if output_name.matches(target) {
+                    return Some(output_name);
+                }
+            }
+
+            // Connected but without a CRTC (all of them taken, e.g. by a parked connector): turning
+            // it on must find the config section that turned it off.
+            for connector in device.drm_scanner.connectors().values() {
+                if connector.state() != connector::State::Connected
+                    || device
+                        .drm_scanner
+                        .crtc_for_connector(&connector.handle())
+                        .is_some()
+                {
+                    continue;
+                }
+
+                let connector_name = format_connector_name(connector);
+                let output_name = if disable_monitor_names {
+                    OutputName {
+                        connector: connector_name,
+                        make: None,
+                        model: None,
+                        serial: None,
+                    }
+                } else {
+                    make_output_name(&device.drm, connector.handle(), connector_name)
+                };
                 if output_name.matches(target) {
                     return Some(output_name);
                 }
