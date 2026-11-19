@@ -112,6 +112,15 @@ impl<D: SeatHandler> PointerOrTouchStartData<D> {
     }
 }
 
+/// Double arrow shown over a gap between windows (the edge cursors are single arrows).
+fn gap_cursor_icon(edges: ResizeEdge) -> CursorIcon {
+    if edges.intersects(ResizeEdge::TOP_BOTTOM) {
+        CursorIcon::NsResize
+    } else {
+        CursorIcon::EwResize
+    }
+}
+
 impl State {
     pub fn process_input_event<I: InputBackend + 'static>(&mut self, event: InputEvent<I>)
     where
@@ -2385,6 +2394,29 @@ impl State {
         }
     }
 
+    /// Filigrane: show the resize cursor while the pointer is over a gap between tiled windows.
+    fn update_gap_cursor(&mut self) {
+        let pointer = self.niri.seat.get_pointer().unwrap();
+        if pointer.is_grabbed() {
+            return;
+        }
+        match self.niri.gap_resize_under_cursor() {
+            Some((_, edges)) => {
+                self.niri.gap_cursor = true;
+                self.niri
+                    .cursor_manager
+                    .set_cursor_image(CursorImageStatus::Named(gap_cursor_icon(edges)));
+            }
+            None if self.niri.gap_cursor => {
+                self.niri.gap_cursor = false;
+                self.niri
+                    .cursor_manager
+                    .set_cursor_image(CursorImageStatus::default_named());
+            }
+            None => {}
+        }
+    }
+
     fn on_pointer_motion<I: InputBackend>(&mut self, event: I::PointerMotionEvent) {
         let was_inside_hot_corner = self.niri.pointer_inside_hot_corner;
         // Any of the early returns here mean that the pointer is not inside the hot corner.
@@ -2630,6 +2662,8 @@ impl State {
             }
         }
 
+        self.update_gap_cursor();
+
         // Redraw to update the cursor position.
         // FIXME: redraw only outputs overlapping the cursor.
         self.niri.queue_redraw_all();
@@ -2727,6 +2761,8 @@ impl State {
                 self.niri.layout.dnd_update(output, pos_within_output);
             }
         }
+
+        self.update_gap_cursor();
 
         // Redraw to update the cursor position.
         // FIXME: redraw only outputs overlapping the cursor.
@@ -2868,6 +2904,31 @@ impl State {
 
                         // Don't activate the window under the cursor to avoid unnecessary
                         // scrolling when e.g. Mod+MMB clicking on a partially off-screen window.
+                        return;
+                    }
+                }
+            }
+
+            // Filigrane: a click on the gap between two tiled windows drags the border like Mod+RMB.
+            if button == Some(MouseButton::Left) && !pointer.is_grabbed() && !is_overview_open {
+                if let Some((window, edges)) = self.niri.gap_resize_under_cursor() {
+                    self.niri.layout.activate_window(&window);
+                    if self
+                        .niri
+                        .layout
+                        .interactive_resize_begin(window.clone(), edges)
+                    {
+                        let start_data = PointerGrabStartData {
+                            focus: None,
+                            button: button_code,
+                            location: pointer.current_location(),
+                        };
+                        let grab = ResizeGrab::new(start_data, window);
+                        pointer.set_grab(self, grab, serial, Focus::Clear);
+                        self.niri
+                            .cursor_manager
+                            .set_cursor_image(CursorImageStatus::Named(gap_cursor_icon(edges)));
+                        self.niri.queue_redraw_all();
                         return;
                     }
                 }

@@ -1800,6 +1800,44 @@ impl<W: LayoutElement> Workspace<W> {
             })
     }
 
+    /// Tiled window and edge whose neighbouring gap (right of or below the tile) contains the point.
+    ///
+    /// Filigrane: dragging a gap resizes the window next to it, like dragging a border.
+    pub fn gap_resize_under(
+        &self,
+        pos: Point<f64, Logical>,
+    ) -> Option<(W::Id, ResizeEdge, Rectangle<f64, Logical>)> {
+        let gap = self.options.layout.gaps;
+        if gap <= 0. {
+            return None;
+        }
+        self.scrolling
+            .tiles_with_render_positions()
+            .find_map(|(tile, tile_pos, visible)| {
+                if !visible {
+                    return None;
+                }
+                let size = tile.tile_size().to_f64();
+                let rel = pos - tile_pos;
+                let in_y = rel.y >= 0. && rel.y < size.h;
+                let in_x = rel.x >= 0. && rel.x < size.w;
+                // Discreet line in the middle of the gap, a quarter of the tile long.
+                let t = 3.;
+                let (edge, line) = if in_y && rel.x >= size.w && rel.x < size.w + gap {
+                    let len = size.h / 4.;
+                    let loc = tile_pos + Point::from((size.w + (gap - t) / 2., (size.h - len) / 2.));
+                    (ResizeEdge::RIGHT, Rectangle::new(loc, Size::from((t, len))))
+                } else if in_x && rel.y >= size.h && rel.y < size.h + gap {
+                    let len = size.w / 4.;
+                    let loc = tile_pos + Point::from(((size.w - len) / 2., size.h + (gap - t) / 2.));
+                    (ResizeEdge::BOTTOM, Rectangle::new(loc, Size::from((len, t))))
+                } else {
+                    return None;
+                };
+                Some((tile.window().id().clone(), edge, line))
+            })
+    }
+
     pub fn descendants_added(&mut self, id: &W::Id) -> bool {
         self.floating.descendants_added(id)
     }

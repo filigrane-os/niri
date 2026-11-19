@@ -33,6 +33,7 @@ use smithay::backend::renderer::element::{
 };
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::renderer::sync::SyncPoint;
+use smithay::backend::renderer::utils::CommitCounter;
 use smithay::backend::renderer::Color32F;
 use smithay::desktop::utils::{
     bbox_from_surface_tree, output_update, send_dmabuf_feedback_surface_tree,
@@ -176,7 +177,7 @@ use crate::utils::spawning::{CHILD_DISPLAY, CHILD_ENV};
 use crate::utils::vblank_throttle::VBlankThrottle;
 use crate::utils::watcher::Watcher;
 use crate::utils::xwayland::satellite::Satellite;
-use crate::utils::{
+use crate::utils::{ResizeEdge, 
     center, center_f64, expand_home, get_monotonic_time, ipc_transform_to_smithay, is_mapped,
     logical_output, make_screenshot_path, output_matches_name, output_size, panel_orientation,
     send_scale_transform, write_png_rgba8, xwayland,
@@ -355,6 +356,9 @@ pub struct Niri {
     /// taking grabs into account is expected, because we pass the information to pointer.motion()
     /// which passes it down through grabs, which decide what to do with it as they see fit.
     pub pointer_contents: PointContents,
+    // The cursor currently shows the resize icon of a gap between windows (Filigrane).
+    pub gap_cursor: bool,
+    gap_indicator_id: Id,
     pub pointer_visibility: PointerVisibility,
     pub pointer_inactivity_timer: Option<RegistrationToken>,
     /// Whether the pointer inactivity timer got reset this event loop iteration.
@@ -2574,6 +2578,8 @@ impl Niri {
             cursor_shape_manager_state,
             dnd_icon: None,
             pointer_contents: PointContents::default(),
+            gap_cursor: false,
+            gap_indicator_id: Id::new(),
             pointer_visibility: PointerVisibility::Visible,
             pointer_inactivity_timer: None,
             pointer_inactivity_timer_got_reset: false,
@@ -3272,6 +3278,57 @@ impl Niri {
     pub fn window_under_cursor(&self) -> Option<&Mapped> {
         let pos = self.seat.get_pointer().unwrap().current_location();
         self.window_under(pos)
+    }
+
+    /// Filigrane: window and edge to resize when the pointer is over a gap between tiled windows.
+    pub fn gap_resize_under_cursor(&self) -> Option<(Window, ResizeEdge)> {
+        self.gap_resize_hit().map(|(_, window, edge, _)| (window, edge))
+    }
+
+    /// Output, window, edge and indicator line (in output coordinates) of the gap under the pointer.
+    fn gap_resize_hit(&self) -> Option<(Output, Window, ResizeEdge, Rectangle<f64, Logical>)> {
+        if self.exit_confirm_dialog.is_open()
+            || self.is_locked()
+            || self.screenshot_ui.is_open()
+            || self.window_mru_ui.is_open()
+        {
+            return None;
+        }
+        let pos = self.seat.get_pointer().unwrap().current_location();
+        let (output, pos_within_output) = self.output_under(pos)?;
+        // Only over bare desktop: not a window, a layer surface (bar, launcher) or a hot corner.
+        let contents = self.contents_under(pos);
+        if contents.surface.is_some() || contents.window.is_some() || contents.layer.is_some() {
+            return None;
+        }
+        if self.is_layout_obscured_under(output, pos_within_output) {
+            return None;
+        }
+        let (window, edge, line) = self.layout.gap_resize_under(output, pos_within_output)?;
+        Some((output.clone(), window, edge, line))
+    }
+
+    /// Filigrane: accent line shown in the gap under the pointer, next to the double-arrow cursor.
+    fn gap_indicator(&self, output: &Output) -> Option<SolidColorRenderElement> {
+        if self.pointer_grab_active() {
+            return None;
+        }
+        let (out, _, _, line) = self.gap_resize_hit()?;
+        if out != *output {
+            return None;
+        }
+        let color = Color32F::from(self.config.borrow().layout.border.active_color);
+        Some(SolidColorRenderElement::new(
+            self.gap_indicator_id.clone(),
+            line,
+            CommitCounter::default(),
+            color,
+            Kind::Unspecified,
+        ))
+    }
+
+    fn pointer_grab_active(&self) -> bool {
+        self.seat.get_pointer().unwrap().is_grabbed()
     }
 
     /// Returns contents under the given point.
@@ -4211,6 +4268,10 @@ impl Niri {
         // The pointer goes on the top.
         if include_pointer && self.pointer_visibility.is_visible() {
             self.render_pointer(ctx.renderer, output, &mut |elem| push(elem.into()));
+        }
+
+        if let Some(line) = self.gap_indicator(output) {
+            push(line.into());
         }
 
         // Next, the screen transition texture.
